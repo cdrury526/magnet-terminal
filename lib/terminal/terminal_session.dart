@@ -54,15 +54,14 @@ class TerminalSession with ChangeNotifier {
   /// truncating scrollback prematurely. Each line consumes roughly 200-400
   /// bytes of memory depending on content, so 50k lines ≈ 10-20 MB per
   /// session — well within budget for a desktop app.
-  TerminalSession({
-    int maxScrollback = 50000,
-  })  : terminal = Terminal(
-          maxLines: maxScrollback,
-          // Configure DA1/DA2/DA3/XTVERSION/DECRQM responses so CLI apps
-          // (Claude Code, Codex CLI, Gemini CLI) detect proper capabilities.
-          emitter: PtyEnvironment.buildEmitter(),
-        ),
-        terminalController = TerminalController();
+  TerminalSession({int maxScrollback = 50000})
+    : terminal = Terminal(
+        maxLines: maxScrollback,
+        // Configure DA1/DA2/DA3/XTVERSION/DECRQM responses so CLI apps
+        // (Claude Code, Codex CLI, Gemini CLI) detect proper capabilities.
+        emitter: PtyEnvironment.buildEmitter(),
+      ),
+      terminalController = TerminalController();
 
   // ---------------------------------------------------------------------------
   //  Public state
@@ -160,13 +159,18 @@ class TerminalSession with ChangeNotifier {
       extraVars: extraEnvironment,
     );
 
+    debugPrint(
+      'TerminalSession.start: spawning ${_executable!} '
+      'with ${columns}x$rows '
+      'cwd=${workingDirectory ?? PtyEnvironment.homeDirectory}',
+    );
+
     // Spawn the PTY process.
     _pty = Pty.start(
       _executable!,
       arguments: arguments,
       environment: environment,
-      workingDirectory:
-          workingDirectory ?? PtyEnvironment.homeDirectory,
+      workingDirectory: workingDirectory ?? PtyEnvironment.homeDirectory,
       columns: columns,
       rows: rows,
     );
@@ -320,15 +324,15 @@ class TerminalSession with ChangeNotifier {
 
   /// Terminal resize -> PTY resize (sends SIGWINCH to child).
   void _wireResize() {
-    terminal.onResize = (int width, int height, int pixelWidth,
-        int pixelHeight) {
-      if (_status != SessionStatus.running || _pty == null) return;
-      try {
-        _pty!.resize(height, width);
-      } on PtyException catch (_) {
-        // Resize race with process exit.
-      }
-    };
+    terminal.onResize =
+        (int width, int height, int pixelWidth, int pixelHeight) {
+          if (_status != SessionStatus.running || _pty == null) return;
+          try {
+            _pty!.resize(height, width);
+          } on PtyException catch (_) {
+            // Resize race with process exit.
+          }
+        };
   }
 
   /// Track OSC title changes from the shell.

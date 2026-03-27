@@ -86,7 +86,8 @@ class _TabbedTerminalScreenState extends State<TabbedTerminalScreen> {
       oldWidget.tabManager.removeListener(_onTabManagerChanged);
       widget.tabManager.addListener(_onTabManagerChanged);
       _syncFocusNodes();
-      _cachedShortcuts = null; // Invalidate — new manager may have different state.
+      _cachedShortcuts =
+          null; // Invalidate — new manager may have different state.
     }
     if (oldWidget.settings != widget.settings) {
       oldWidget.settings.removeListener(_onSettingsChanged);
@@ -244,10 +245,7 @@ class _TabbedTerminalScreenState extends State<TabbedTerminalScreen> {
 
       // Cmd+1 through Cmd+9 — select tab by index (Cmd+9 = last tab)
       for (var i = 1; i <= 9; i++)
-        SingleActivator(
-          _digitKeys[i]!,
-          meta: true,
-        ): () {
+        SingleActivator(_digitKeys[i]!, meta: true): () {
           if (i == 9) {
             // Cmd+9 always jumps to the last tab (macOS convention).
             tabManager.selectTab(tabManager.tabCount - 1);
@@ -305,9 +303,7 @@ class _TabbedTerminalScreenState extends State<TabbedTerminalScreen> {
                     ),
 
                     // Tab bar fills the remaining title bar space
-                    Expanded(
-                      child: TerminalTabBar(tabManager: tabManager),
-                    ),
+                    Expanded(child: TerminalTabBar(tabManager: tabManager)),
                   ],
                 ),
               ),
@@ -373,41 +369,73 @@ class _TerminalTab extends StatefulWidget {
 }
 
 class _TerminalTabState extends State<_TerminalTab> {
+  bool _waitingForInitialResize = false;
+
   @override
   void initState() {
     super.initState();
-    // Delay starting the session until after the first frame so we can
-    // estimate the terminal size from the widget's constraints. This avoids
-    // starting the shell with the default 80x24 and then immediately resizing,
-    // which causes the prompt to appear in the middle of a larger terminal.
     if (widget.session.status == SessionStatus.idle) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        final size = _estimateTerminalSize();
-        widget.session.start(columns: size.columns, rows: size.rows);
-      });
+      _startSessionWhenTerminalReady();
     }
   }
 
-  /// Estimates the terminal size based on the widget's constraints.
-  /// Returns (columns, rows) as a record.
-  ({int columns, int rows}) _estimateTerminalSize() {
-    final renderBox = context.findRenderObject() as RenderBox?;
-    if (renderBox == null) return (columns: 80, rows: 24);
+  void _startSessionWhenTerminalReady() {
+    if (_waitingForInitialResize) return;
+    _waitingForInitialResize = true;
 
-    final size = renderBox.size;
-    final settings = widget.settings;
+    final terminal = widget.session.terminal;
+    _debugStartupTrace(
+      'waiting for initial terminal size; current view='
+      '${terminal.viewWidth}x${terminal.viewHeight}',
+    );
 
-    // Calculate cell size from the terminal style.
-    final fontSize = settings.terminalStyle?.fontSize ?? 14;
-    final lineHeight = fontSize * 1.2; // Default line height multiplier
-    final charWidth = fontSize * 0.6; // Approximate char width for monospace
+    void scheduleStartIfIdle(int columns, int rows, {required String source}) {
+      if (!mounted || widget.session.status != SessionStatus.idle) return;
+      if (columns <= 0 || rows <= 0) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || widget.session.status != SessionStatus.idle) return;
+        _debugStartupTrace(
+          'starting session with ${columns}x$rows from $source',
+        );
+        widget.session.start(columns: columns, rows: rows);
+      });
+    }
 
-    // Estimate columns and rows, leaving some padding.
-    final columns = (size.width / charWidth).floor().clamp(20, 512);
-    final rows = (size.height / lineHeight).floor().clamp(10, 256);
+    // Let the first real auto-resize from TerminalView determine the startup
+    // size so the shell doesn't print its initial prompt into a guessed 80x24
+    // viewport and then appear vertically centered after resize.
+    terminal.onResize =
+        (int width, int height, int pixelWidth, int pixelHeight) {
+          terminal.onResize = null;
+          _debugStartupTrace(
+            'received initial resize ${width}x$height '
+            '(pixels ${pixelWidth}x$pixelHeight)',
+          );
+          scheduleStartIfIdle(width, height, source: 'initial-resize');
+        };
 
-    return (columns: columns, rows: rows);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.session.status != SessionStatus.idle) return;
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || widget.session.status != SessionStatus.idle) return;
+
+        terminal.onResize = null;
+        _debugStartupTrace(
+          'falling back to terminal view size '
+          '${terminal.viewWidth}x${terminal.viewHeight}',
+        );
+        scheduleStartIfIdle(
+          terminal.viewWidth,
+          terminal.viewHeight,
+          source: 'fallback-view-size',
+        );
+      });
+    });
+  }
+
+  void _debugStartupTrace(String message) {
+    debugPrint('TerminalStartup: $message');
   }
 
   @override
