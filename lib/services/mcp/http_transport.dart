@@ -4,15 +4,19 @@
 /// [dart:io HttpServer]. Handles JSON-RPC messages over HTTP POST
 /// requests to `/mcp`, plus a GET health endpoint at `/health`.
 ///
-/// Uses JSON response mode (no SSE) — each POST receives a synchronous
-/// JSON-RPC response. This matches the simplified local devtools pattern.
+/// This transport keeps request/response correlation by JSON-RPC id and
+/// exposes a minimal session model via the `Mcp-Session-Id` header so
+/// clients can keep a stable logical connection across multiple HTTP
+/// requests and optional SSE listeners.
 library;
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:dart_mcp/dart_mcp.dart';
+import 'package:flutter/foundation.dart';
 
 /// MCP protocol version advertised in response headers.
 const _kProtocolVersion = '2025-06-18';
@@ -21,10 +25,10 @@ const _kProtocolVersion = '2025-06-18';
 ///
 /// Listens on a configurable localhost port and translates HTTP POST
 /// requests into the [Transport.incoming] stream. Responses from the
-/// MCP server are buffered per-request and written back as the HTTP
-/// response body.
+/// MCP server are matched back to the originating HTTP request by
+/// JSON-RPC request id.
 ///
-/// The transport manages its own [HttpServer] lifecycle — call [start]
+/// The transport manages its own [HttpServer] lifecycle. Call [start]
 /// to bind the port, and [close] to shut down gracefully.
 class HttpTransport implements Transport {
   /// Creates an HTTP transport that will listen on [port].
@@ -37,15 +41,10 @@ class HttpTransport implements Transport {
 
   HttpServer? _server;
   final _incomingController = StreamController<String>();
-  final _sseConnections = <HttpResponse>{};
+  final _pendingResponses = <String, Completer<String>>{};
+  final _sseConnections = <_SseConnection>{};
 
-  /// Completer that pairs each incoming request with its HTTP response.
-  ///
-  /// The MCP server processes the incoming message and calls [send],
-  /// which completes the pending response. This ensures the HTTP
-  /// response contains the JSON-RPC reply.
-  Completer<String>? _pendingResponse;
-
+  String? _sessionId;
   bool _closed = false;
 
   @override
@@ -57,10 +56,18 @@ class HttpTransport implements Transport {
       throw TransportException('Transport is closed');
     }
 
-    // Complete the pending HTTP response with this message.
-    if (_pendingResponse case final completer? when !completer.isCompleted) {
-      completer.complete(message);
+    debugPrint('HttpTransport.send: $message');
+
+    final responseId = _extractMessageId(message);
+    if (responseId != null) {
+      final completer = _pendingResponses.remove(responseId);
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(message);
+      }
+      return;
     }
+
+    await _broadcastSseMessage(message);
   }
 
   @override
@@ -68,10 +75,20 @@ class HttpTransport implements Transport {
     if (_closed) return;
     _closed = true;
 
+    for (final completer in _pendingResponses.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(
+          const TransportException('Transport closed before response arrived'),
+        );
+      }
+    }
+    _pendingResponses.clear();
+
     for (final sse in _sseConnections) {
       await sse.close();
     }
     _sseConnections.clear();
+
     await _server?.close(force: true);
     _server = null;
     await _incomingController.close();
@@ -79,7 +96,7 @@ class HttpTransport implements Transport {
 
   /// Bind the HTTP server and start accepting requests.
   ///
-  /// Returns the bound port (useful if port 0 was used for auto-assign).
+  /// Returns the bound port, useful if port 0 was used for auto-assign.
   Future<int> start() async {
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
 
@@ -104,25 +121,21 @@ class HttpTransport implements Transport {
   bool get isRunning => _server != null && !_closed;
 
   Future<void> _handleRequest(HttpRequest request) async {
-    // Add CORS headers for local development tools.
     request.response.headers
       ..set('Access-Control-Allow-Origin', '*')
       ..set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
       ..set(
         'Access-Control-Allow-Headers',
-        'Content-Type, Mcp-Protocol-Version, Mcp-Session-Id',
+        'Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id',
       );
 
-    // Handle CORS preflight.
     if (request.method == 'OPTIONS') {
       request.response.statusCode = HttpStatus.noContent;
       await request.response.close();
       return;
     }
 
-    final path = request.uri.path;
-
-    switch ((request.method, path)) {
+    switch ((request.method, request.uri.path)) {
       case ('GET', '/health'):
         await _handleHealth(request);
       case ('GET', '/mcp'):
@@ -137,25 +150,36 @@ class HttpTransport implements Transport {
   }
 
   /// Handle GET /mcp — SSE endpoint for server-to-client messages.
-  ///
-  /// The MCP streamable HTTP spec requires this endpoint. The client
-  /// opens a long-lived SSE connection to receive server-initiated
-  /// notifications. We keep the connection open until the client
-  /// disconnects or the server shuts down.
   Future<void> _handleMcpSse(HttpRequest request) async {
+    final requestSessionId = request.headers.value('Mcp-Session-Id');
+    if (_sessionId != null &&
+        requestSessionId != null &&
+        requestSessionId != _sessionId) {
+      request.response.statusCode = HttpStatus.notFound;
+      request.response.write('Unknown MCP session');
+      await request.response.close();
+      return;
+    }
+
     request.response
       ..statusCode = HttpStatus.ok
+      ..bufferOutput = false
       ..headers.set('Content-Type', 'text/event-stream')
       ..headers.set('Cache-Control', 'no-cache')
       ..headers.set('Connection', 'keep-alive')
       ..headers.set('Mcp-Protocol-Version', _kProtocolVersion);
 
-    // Keep the connection alive. We don't send server-initiated
-    // notifications for devtools, so just hold the connection open.
-    // The client will close it when done.
-    _sseConnections.add(request.response);
-    request.response.done.whenComplete(() {
-      _sseConnections.remove(request.response);
+    if (_sessionId case final sessionId?) {
+      request.response.headers.set('Mcp-Session-Id', sessionId);
+    }
+
+    final connection = _SseConnection(request.response);
+    _sseConnections.add(connection);
+    await connection.open();
+
+    request.response.done.whenComplete(() async {
+      _sseConnections.remove(connection);
+      await connection.close();
     });
   }
 
@@ -163,11 +187,14 @@ class HttpTransport implements Transport {
     request.response
       ..statusCode = HttpStatus.ok
       ..headers.contentType = ContentType.json
-      ..write(jsonEncode({
-        'status': 'ok',
-        'protocol_version': _kProtocolVersion,
-        'port': boundPort,
-      }));
+      ..write(
+        jsonEncode({
+          'status': 'ok',
+          'protocol_version': _kProtocolVersion,
+          'port': boundPort,
+          if (_sessionId != null) 'session_id': _sessionId,
+        }),
+      );
     await request.response.close();
   }
 
@@ -179,45 +206,88 @@ class HttpTransport implements Transport {
       return;
     }
 
+    String? requestKey;
+
     try {
       final body = await utf8.decoder.bind(request).join();
-
-      // Parse to check if this is a JSON-RPC notification (no "id" field).
-      // Notifications don't produce responses, so we must not wait for one.
       final json = jsonDecode(body);
-      final isNotification = json is Map<String, dynamic> &&
-          json.containsKey('method') &&
-          !json.containsKey('id');
 
-      if (isNotification) {
-        // Feed to the MCP server but respond immediately with 202 Accepted.
-        _incomingController.add(body);
-        request.response
-          ..statusCode = HttpStatus.accepted
-          ..headers.set('Mcp-Protocol-Version', _kProtocolVersion);
+      if (json is! Map<String, dynamic>) {
+        request.response.statusCode = HttpStatus.badRequest;
+        request.response.write('Expected a JSON-RPC object');
         await request.response.close();
         return;
       }
 
-      // Set up the response completer before feeding the message.
-      _pendingResponse = Completer<String>();
+      final method = json['method'];
+      final requestId = json['id'];
+      final requestSessionId = request.headers.value('Mcp-Session-Id');
+      final isNotification =
+          json.containsKey('method') && !json.containsKey('id');
 
-      // Feed the message to the MCP server via the incoming stream.
+      debugPrint(
+        'HttpTransport._handleMcpPost: method=$method id=$requestId '
+        'notification=$isNotification session=$requestSessionId',
+      );
+
+      if (_sessionId != null &&
+          requestSessionId != null &&
+          requestSessionId != _sessionId) {
+        request.response.statusCode = HttpStatus.notFound;
+        request.response.write('Unknown MCP session');
+        await request.response.close();
+        return;
+      }
+
+      if (method == 'initialize' && requestId != null) {
+        _sessionId ??= _generateSessionId();
+      }
+
+      if (isNotification) {
+        _incomingController.add(body);
+        request.response
+          ..statusCode = HttpStatus.accepted
+          ..headers.set('Mcp-Protocol-Version', _kProtocolVersion);
+        if (_sessionId case final sessionId?) {
+          request.response.headers.set('Mcp-Session-Id', sessionId);
+        }
+        await request.response.close();
+        return;
+      }
+
+      requestKey = _requestKey(requestId);
+      if (requestKey == null) {
+        request.response.statusCode = HttpStatus.badRequest;
+        request.response.write('JSON-RPC request is missing a valid id');
+        await request.response.close();
+        return;
+      }
+
+      final responseCompleter = Completer<String>();
+      _pendingResponses[requestKey] = responseCompleter;
       _incomingController.add(body);
+      debugPrint(
+        'HttpTransport._handleMcpPost: queued request key=$requestKey '
+        'pending=${_pendingResponses.length}',
+      );
 
-      // Wait for the MCP server to produce a response via [send].
-      final responseBody = await _pendingResponse!.future.timeout(
+      final responseBody = await responseCompleter.future.timeout(
         const Duration(seconds: 30),
         onTimeout: () => jsonEncode({
           'jsonrpc': '2.0',
-          'id': null,
-          'error': {
-            'code': -32603,
-            'message': 'Request timed out',
-          },
+          'id': requestId,
+          'error': {'code': -32603, 'message': 'Request timed out'},
         }),
       );
 
+      debugPrint(
+        'HttpTransport._handleMcpPost: response ready key=$requestKey '
+        'body=$responseBody',
+      );
+
+      if (_sessionId case final sessionId?) {
+        request.response.headers.set('Mcp-Session-Id', sessionId);
+      }
       request.response
         ..statusCode = HttpStatus.ok
         ..headers.contentType = ContentType.json
@@ -225,12 +295,97 @@ class HttpTransport implements Transport {
         ..write(responseBody);
       await request.response.close();
     } on Exception catch (e) {
-      request.response
-        ..statusCode = HttpStatus.internalServerError
-        ..write('Internal server error: $e');
+      try {
+        request.response.statusCode = HttpStatus.internalServerError;
+      } on StateError {
+        // Headers were already committed. Fall through and append the error.
+      }
+      request.response.write('Internal server error: $e');
       await request.response.close();
     } finally {
-      _pendingResponse = null;
+      if (requestKey != null) {
+        _pendingResponses.remove(requestKey);
+      }
+    }
+  }
+
+  Future<void> _broadcastSseMessage(String message) async {
+    if (_sseConnections.isEmpty) return;
+
+    final staleConnections = <_SseConnection>[];
+    for (final connection in _sseConnections) {
+      try {
+        await connection.sendJsonMessage(message);
+      } on Exception {
+        staleConnections.add(connection);
+      }
+    }
+
+    for (final connection in staleConnections) {
+      _sseConnections.remove(connection);
+      await connection.close();
+    }
+  }
+
+  String? _extractMessageId(String message) {
+    try {
+      final json = jsonDecode(message);
+      if (json is! Map<String, dynamic>) {
+        return null;
+      }
+      return _requestKey(json['id']);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  String? _requestKey(Object? id) {
+    if (id == null) return null;
+    return jsonEncode(id);
+  }
+
+  String _generateSessionId() {
+    final now = DateTime.now().microsecondsSinceEpoch.toRadixString(16);
+    final random = Random.secure().nextInt(0x7fffffff).toRadixString(16);
+    return '$now-$random';
+  }
+}
+
+class _SseConnection {
+  _SseConnection(this._response);
+
+  final HttpResponse _response;
+  bool _closed = false;
+  int _eventId = 0;
+
+  Future<void> open() async {
+    if (_closed) return;
+    _response.write('retry: 15000\n\n');
+    await _response.flush();
+  }
+
+  Future<void> sendJsonMessage(String message) async {
+    if (_closed) return;
+
+    _eventId += 1;
+    _response.write('event: message\n');
+    _response.write('id: $_eventId\n');
+
+    final normalized = message.replaceAll('\r', '');
+    for (final line in const LineSplitter().convert(normalized)) {
+      _response.write('data: $line\n');
+    }
+    _response.write('\n');
+    await _response.flush();
+  }
+
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    try {
+      await _response.close();
+    } on Exception {
+      // Ignore shutdown errors from already-closed connections.
     }
   }
 }
