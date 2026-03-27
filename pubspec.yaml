@@ -1,0 +1,26 @@
+name: magnet_terminal
+description: A production-grade macOS terminal emulator.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.10.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dart_xterm:
+    path: /Users/chrisdrury/projects/dart_xterm
+  dart_pty:
+    path: /Users/chrisdrury/projects/dart_pty
+  dart_mcp:
+    path: /Users/chrisdrury/projects/DEV_RAG/dart_mcp
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
