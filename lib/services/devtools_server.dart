@@ -34,6 +34,7 @@ import 'mcp/tool_registry.dart';
 /// final server = DevtoolsServer(
 ///   terminalProvider: () => tabManager.activeSession.terminal,
 ///   ptyWriterProvider: () => tabManager.activeSession.writeToPty,
+///   sessionProvider: () => tabManager.activeSession,
 /// );
 /// await server.start();
 /// // ... app runs ...
@@ -54,15 +55,18 @@ class DevtoolsServer {
   DevtoolsServer({
     required TerminalProvider terminalProvider,
     PtyWriterProvider? ptyWriterProvider,
+    SessionProvider? sessionProvider,
     this.port = 9730,
-  })  : _terminalProvider = terminalProvider,
-        _ptyWriterProvider = ptyWriterProvider;
+  }) : _terminalProvider = terminalProvider,
+       _ptyWriterProvider = ptyWriterProvider,
+       _sessionProvider = sessionProvider;
 
   /// The localhost port the server listens on.
   final int port;
 
   final TerminalProvider _terminalProvider;
   final PtyWriterProvider? _ptyWriterProvider;
+  final SessionProvider? _sessionProvider;
 
   HttpTransport? _transport;
   FastMCP? _mcp;
@@ -97,10 +101,7 @@ class DevtoolsServer {
     try {
       _transport = HttpTransport(port: port);
 
-      _mcp = FastMCP(
-        'magnet-devtools',
-        transport: _transport,
-      );
+      _mcp = FastMCP('magnet-devtools', transport: _transport);
 
       // Register all tools (inspection + debug).
       registerDevtools(
@@ -109,6 +110,7 @@ class DevtoolsServer {
         escapeBuffer: escapeBuffer,
         debugState: debugState,
         ptyWriterProvider: _ptyWriterProvider,
+        sessionProvider: _sessionProvider,
       );
 
       // Start the HTTP server.

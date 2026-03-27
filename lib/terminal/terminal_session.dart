@@ -17,6 +17,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'package:magnet_terminal/terminal/pty_environment.dart';
+import 'package:magnet_terminal/terminal/session_debug_hooks.dart';
 
 /// Status of a [TerminalSession]'s underlying process.
 enum SessionStatus {
@@ -46,6 +47,22 @@ enum SessionStatus {
 /// Dispose the session when the tab is closed — this kills the child process
 /// and releases all resources.
 class TerminalSession with ChangeNotifier {
+  static const _startupEnvKeys = <String>[
+    'TERM',
+    'COLORTERM',
+    'TERM_PROGRAM',
+    'TERM_PROGRAM_VERSION',
+    'FORCE_HYPERLINK',
+    'COLORFGBG',
+    'TERM_PROGRAM_BACKGROUND',
+    'LANG',
+    'LC_ALL',
+    'CI',
+    'TEAMCITY_VERSION',
+    'VTE_VERSION',
+  ];
+  static const _traceOutputPreviewLimit = 240;
+
   /// Creates a new terminal session.
   ///
   /// [maxScrollback] controls how many lines the terminal buffer retains
@@ -55,13 +72,37 @@ class TerminalSession with ChangeNotifier {
   /// bytes of memory depending on content, so 50k lines ≈ 10-20 MB per
   /// session — well within budget for a desktop app.
   TerminalSession({int maxScrollback = 50000})
-    : terminal = Terminal(
-        maxLines: maxScrollback,
-        // Configure DA1/DA2/DA3/XTVERSION/DECRQM responses so CLI apps
-        // (Claude Code, Codex CLI, Gemini CLI) detect proper capabilities.
-        emitter: PtyEnvironment.buildEmitter(),
-      ),
-      terminalController = TerminalController();
+    : this._(
+        maxScrollback: maxScrollback,
+        handshakeRecorder: HandshakeRecorder(),
+        probeOverrides: ProbeOverrideState(),
+      );
+
+  TerminalSession._({
+    required int maxScrollback,
+    required this.handshakeRecorder,
+    required this.probeOverrides,
+  }) : terminal = Terminal(
+         maxLines: maxScrollback,
+         // Configure DA1/DA2/DA3/XTVERSION/DECRQM responses so CLI apps
+         // (Claude Code, Codex CLI, Gemini CLI) detect proper capabilities.
+         emitter: PtyEnvironment.buildEmitter(),
+         debugConfig: TerminalDebugConfig(
+           onLog: (level, component, message) {
+             if (component == 'parser' &&
+                 message.startsWith('XTGETTCAP request:')) {
+               debugPrint(
+                 'TerminalSession.terminal[$level/$component]: $message',
+               );
+             }
+           },
+           onTerminalResponse: (kind, data) {
+             final bytes = Uint8List.fromList(latin1.encode(data));
+             handshakeRecorder.recordTerminalInput(bytes, responseKind: kind);
+           },
+         ),
+       ),
+       terminalController = TerminalController();
 
   // ---------------------------------------------------------------------------
   //  Public state
@@ -72,6 +113,8 @@ class TerminalSession with ChangeNotifier {
 
   /// Controller for the terminal view (selection, highlights).
   final TerminalController terminalController;
+  final HandshakeRecorder handshakeRecorder;
+  final ProbeOverrideState probeOverrides;
 
   /// Current lifecycle status of the session.
   SessionStatus get status => _status;
@@ -119,6 +162,8 @@ class TerminalSession with ChangeNotifier {
 
   final _outputBuffer = BytesBuilder(copy: false);
   bool _flushScheduled = false;
+  int _interestingInputTraceCount = 0;
+  int _interestingOutputTraceCount = 0;
 
   // ---------------------------------------------------------------------------
   //  Lifecycle
@@ -164,6 +209,12 @@ class TerminalSession with ChangeNotifier {
       'with ${columns}x$rows '
       'cwd=${workingDirectory ?? PtyEnvironment.homeDirectory}',
     );
+    for (final key in _startupEnvKeys) {
+      final value = environment[key];
+      if (value != null) {
+        debugPrint('TerminalSession.start: env $key=$value');
+      }
+    }
 
     // Spawn the PTY process.
     _pty = Pty.start(
@@ -173,6 +224,9 @@ class TerminalSession with ChangeNotifier {
       workingDirectory: workingDirectory ?? PtyEnvironment.homeDirectory,
       columns: columns,
       rows: rows,
+      onLog: (level, component, message) {
+        debugPrint('TerminalSession.pty[${level.name}/$component]: $message');
+      },
     );
 
     // Wire up bidirectional pipes.
@@ -191,7 +245,9 @@ class TerminalSession with ChangeNotifier {
   /// This bypasses the terminal's input handler — use it for programmatic
   /// input injection (e.g., pasting, sending escape sequences).
   void writeToPty(String data) {
-    _pty?.write(Uint8List.fromList(utf8.encode(data)));
+    final bytes = Uint8List.fromList(utf8.encode(data));
+    handshakeRecorder.recordTerminalInput(bytes);
+    _pty?.write(bytes);
   }
 
   /// Resize the terminal and propagate to the PTY.
@@ -262,6 +318,7 @@ class TerminalSession with ChangeNotifier {
   void _wirePtyToTerminal() {
     _outputSubscription = _pty!.output.listen(
       (data) {
+        handshakeRecorder.recordPtyOutput(data);
         _outputBuffer.add(data);
         _scheduleFlush();
       },
@@ -307,15 +364,76 @@ class TerminalSession with ChangeNotifier {
 
     final bytes = _outputBuffer.takeBytes();
     final decoded = _utf8Decoder.convert(bytes);
+    _traceInterestingOutput(decoded);
     terminal.write(decoded);
+  }
+
+  void _traceInterestingOutput(String decoded) {
+    if (_interestingOutputTraceCount >= 20) return;
+
+    final hasHyperlink = decoded.contains('\x1b]8;');
+    final hasUnderline =
+        decoded.contains('\x1b[4m') ||
+        decoded.contains('\x1b[4:') ||
+        decoded.contains('\x1b[24m');
+    final hasCapabilityProbe =
+        decoded.contains('\x1b[>0q') ||
+        decoded.contains('\x1b[c') ||
+        decoded.contains('\x1b[>c') ||
+        decoded.contains('\x1bP+q');
+
+    if (!hasHyperlink && !hasUnderline && !hasCapabilityProbe) return;
+
+    _interestingOutputTraceCount += 1;
+    final preview = _escapeForLog(decoded);
+    debugPrint(
+      'TerminalSession.outputTrace[$_interestingOutputTraceCount]: '
+      'hyperlink=$hasHyperlink underline=$hasUnderline probe=$hasCapabilityProbe '
+      'preview=$preview',
+    );
+  }
+
+  String _escapeForLog(String value) {
+    final preview = value.length > _traceOutputPreviewLimit
+        ? value.substring(0, _traceOutputPreviewLimit)
+        : value;
+    return jsonEncode(preview);
+  }
+
+  void _traceInterestingInput(String data) {
+    if (_interestingInputTraceCount >= 20) return;
+
+    final isProbeResponse =
+        data.contains('\x1bP>|') ||
+        data.contains('\x1b[?1;2c') ||
+        data.contains('\x1b[>0;100;0c') ||
+        data.contains('\x1bP1+r') ||
+        data.contains('\x1bP0+r');
+    if (!isProbeResponse) return;
+
+    _interestingInputTraceCount += 1;
+    debugPrint(
+      'TerminalSession.inputTrace[$_interestingInputTraceCount]: '
+      'preview=${_escapeForLog(data)}',
+    );
   }
 
   /// Terminal user input (String) -> UTF-8 encode -> PTY.write(bytes).
   void _wireTerminalToPty() {
     terminal.onOutput = (String data) {
       if (_status != SessionStatus.running || _pty == null) return;
+      final originalBytes = Uint8List.fromList(utf8.encode(data));
+      final overriddenData = probeOverrides.apply(data);
+      final effectiveData = overriddenData ?? data;
+      final effectiveBytes = Uint8List.fromList(utf8.encode(effectiveData));
+      _traceInterestingInput(effectiveData);
+      handshakeRecorder.recordTerminalInput(
+        effectiveBytes,
+        responseKind: probeOverrides.classify(data),
+        originalBytes: overriddenData == null ? null : originalBytes,
+      );
       try {
-        _pty!.write(Uint8List.fromList(utf8.encode(data)));
+        _pty!.write(effectiveBytes);
       } on PtyException catch (_) {
         // PTY may be closed if process exited between check and write.
       }

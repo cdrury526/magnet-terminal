@@ -12,10 +12,13 @@ library;
 
 import 'package:dart_mcp/dart_mcp.dart';
 import 'package:dart_xterm/dart_xterm.dart';
+import 'package:magnet_terminal/terminal/terminal_session.dart';
 
 import 'buffer_state_tool.dart';
 import 'cell_inspection_tool.dart';
 import 'escape_logger_tool.dart';
+import 'handshake_recorder_tool.dart';
+import 'probe_override_tool.dart';
 import 'toggle_debug_tool.dart';
 import 'write_sequence_tool.dart';
 
@@ -29,6 +32,9 @@ typedef TerminalProvider = Terminal? Function();
 ///
 /// Returns `null` if no session is available (e.g., process exited).
 typedef PtyWriterProvider = PtyWriter? Function();
+
+/// Callback that returns the currently active [TerminalSession].
+typedef SessionProvider = TerminalSession? Function();
 
 /// Registers all devtools tools on [mcp].
 ///
@@ -47,6 +53,7 @@ void registerDevtools(
   EscapeLogBuffer? escapeBuffer,
   DebugState? debugState,
   PtyWriterProvider? ptyWriterProvider,
+  SessionProvider? sessionProvider,
 }) {
   final buffer = escapeBuffer ?? EscapeLogBuffer();
   final debug = debugState ?? DebugState();
@@ -164,5 +171,39 @@ void registerDevtools(
         'TERM_PROGRAM, and other variables that affect CLI app behavior.',
     inputSchema: toggleDebugSchema,
     handler: (args) => handleToggleDebug(debug, buffer, args),
+  );
+
+  // -----------------------------------------------------------------------
+  //  record_handshake — capture PTY output and terminal responses
+  // -----------------------------------------------------------------------
+  mcp.registerTool(
+    name: 'record_handshake',
+    description:
+        'Record and inspect short-lived PTY output and terminal response '
+        'traffic for capability negotiation. Captures both directions as '
+        'hex and escaped previews so startup handshakes can be compared.',
+    inputSchema: handshakeRecorderSchema,
+    handler: (args) {
+      final session = sessionProvider?.call();
+      if (session == null) return 'Error: no active terminal session';
+      return handleHandshakeRecorder(session, args);
+    },
+  );
+
+  // -----------------------------------------------------------------------
+  //  set_probe_override — override probe responses at runtime
+  // -----------------------------------------------------------------------
+  mcp.registerTool(
+    name: 'set_probe_override',
+    description:
+        'Override individual terminal capability responses at runtime '
+        '(XTVERSION, DA1, DA2, DA3, XTGETTCAP) without rebuilding. Use it '
+        'for A/B testing how CLI apps react to specific probe replies.',
+    inputSchema: probeOverrideSchema,
+    handler: (args) {
+      final session = sessionProvider?.call();
+      if (session == null) return 'Error: no active terminal session';
+      return handleProbeOverride(session, args);
+    },
   );
 }

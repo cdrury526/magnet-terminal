@@ -53,15 +53,14 @@ import 'package:dart_xterm/dart_xterm.dart';
 ///       (`xterm-256color` is NOT recognized here)
 ///   12. Default -> **hyperlinks OFF**
 ///
-///   Since `TERM_PROGRAM=magnet-terminal` is not in the allowlist (step 9)
-///   and `TERM=xterm-256color` is not matched (step 11), without
-///   `FORCE_HYPERLINK=1` the package returns false and Claude Code
-///   falls back to SGR 4m underlines instead of OSC 8 hyperlinks.
+///   Some modern CLIs also appear to hardcode their own TERM_PROGRAM checks
+///   and ignore FORCE_HYPERLINK entirely. To keep those apps on their
+///   hyperlink-capable path, magnet-terminal advertises a compatible
+///   TERM_PROGRAM identity instead of its own app name.
 ///
-///   Long-term fix: submit a PR to chalk/supports-hyperlinks adding
-///   `magnet-terminal` to the TERM_PROGRAM switch. Until then,
-///   FORCE_HYPERLINK=1 is the correct and stable workaround — it is
-///   checked FIRST (step 1) and overrides all other logic.
+///   Long-term fix: get magnet-terminal recognized directly by the relevant
+///   CLI detection libraries. Until then, TERM_PROGRAM compatibility plus
+///   FORCE_HYPERLINK=1 is the most reliable workaround.
 ///
 /// - **COLORTERM** also influences hyperlink decisions in some apps.
 ///
@@ -113,10 +112,17 @@ class PtyEnvironment {
   static const colorTerm = 'truecolor';
 
   /// The terminal program name reported via TERM_PROGRAM.
-  static const termProgram = 'magnet-terminal';
+  ///
+  /// We intentionally advertise WezTerm here as a compatibility identity.
+  /// Several modern CLIs hardcode TERM_PROGRAM allowlists for OSC 8 hyperlink
+  /// support and visual capability decisions, and magnet-terminal is not yet
+  /// recognized by those lists.
+  static const termProgram = 'WezTerm';
 
   /// The terminal program version reported via TERM_PROGRAM_VERSION.
-  static const termProgramVersion = '0.1.0';
+  ///
+  /// WezTerm detection generally expects a date-like version string.
+  static const termProgramVersion = '20240203';
 
   /// Environment variables that are inherited from the parent Dart
   /// process when they exist. These are not overwritten.

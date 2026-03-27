@@ -87,6 +87,7 @@ class _AppShellState extends State<AppShell> {
     _devtoolsServer = DevtoolsServer(
       terminalProvider: () => _tabManager.activeSession.terminal,
       ptyWriterProvider: () => _tabManager.activeSession.writeToPty,
+      sessionProvider: () => _tabManager.activeSession,
     );
     _devtoolsServer.start();
   }
